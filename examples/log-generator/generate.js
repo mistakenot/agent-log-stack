@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // @agent-logs/log-generator
-// Deterministic log generator for E2E tests. Emits logs to all ingest paths.
+// Deterministic log generator for E2E tests. Emits OTLP log records to Vector.
 // Usage: node generate.js --run-id=<id> --agent-id=<id> --app=<name>
 
-const AGENT_LOGS_URL = process.env.AGENT_LOGS_URL || "http://127.0.0.1:8688";
+const AGENT_LOGS_URL = process.env.AGENT_LOGS_URL || "http://127.0.0.1:4318";
 
 // --- Argument parsing ---
 
@@ -25,7 +25,7 @@ function parseArgs(argv) {
 function printHelp() {
   const help = `Usage: node generate.js --run-id=<id> --agent-id=<id> --app=<name>
 
-Generates deterministic logs across all ingest paths for E2E testing.
+Generates deterministic logs across all sources via OTLP for E2E testing.
 
 Options:
   --run-id     Unique run identifier (required)
@@ -34,7 +34,7 @@ Options:
   --help       Show this help message
 
 Environment:
-  AGENT_LOGS_URL  Base URL for Vector ingest (default: http://127.0.0.1:8688)
+  AGENT_LOGS_URL  Base URL for OTLP HTTP ingest (default: http://127.0.0.1:4318)
 
 Each source emits a deterministic marker: e2e_marker_<source>_<run_id>
 Logs are emitted with two agent contexts: <agent_id> and <agent_id>-parallel
@@ -42,18 +42,71 @@ Logs are emitted with two agent contexts: <agent_id> and <agent_id>-parallel
   process.stderr.write(help);
 }
 
+// --- OTLP helpers ---
+
+const SEVERITY_MAP = {
+  trace: 1,
+  debug: 5,
+  info: 9,
+  warn: 13,
+  error: 17,
+  fatal: 21,
+};
+
+function buildOtlpPayload(log) {
+  // Resource attributes: service.name and app
+  const resourceAttributes = [
+    { key: "service.name", value: { stringValue: log.service } },
+    { key: "app", value: { stringValue: log.app } },
+  ];
+
+  // Log record attributes: all extra fields
+  const logAttributes = [];
+  const attrFields = ["source", "agent_id", "run_id", "screen_id", "db_system", "db_name", "worktree"];
+  for (const field of attrFields) {
+    if (log[field] !== undefined) {
+      logAttributes.push({ key: field, value: { stringValue: log[field] } });
+    }
+  }
+
+  const timeUnixNano = String(Date.now() * 1000000);
+
+  return {
+    resourceLogs: [
+      {
+        resource: { attributes: resourceAttributes },
+        scopeLogs: [
+          {
+            scope: {},
+            logRecords: [
+              {
+                timeUnixNano,
+                severityText: log.level.toUpperCase(),
+                severityNumber: SEVERITY_MAP[log.level] || 9,
+                body: { stringValue: log.message },
+                attributes: logAttributes,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
 // --- Log generation ---
 
-async function postLog(path, body) {
-  const url = `${AGENT_LOGS_URL}${path}`;
+async function postLog(log) {
+  const url = `${AGENT_LOGS_URL}/v1/logs`;
+  const payload = buildOtlpPayload(log);
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(`POST ${path} failed: ${response.status} ${response.statusText} - ${text}`);
+    throw new Error(`POST /v1/logs failed: ${response.status} ${response.statusText} - ${text}`);
   }
   return response;
 }
@@ -97,7 +150,7 @@ async function emitBackendLogs(runId, agentId, app) {
   ];
 
   for (const log of logs) {
-    await postLog("/ingest/logs", log);
+    await postLog(log);
   }
   return logs.length;
 }
@@ -129,7 +182,7 @@ async function emitBrowserLogs(runId, agentId, app) {
   ];
 
   for (const log of logs) {
-    await postLog("/ingest/browser", log);
+    await postLog(log);
   }
   return logs.length;
 }
@@ -159,7 +212,7 @@ async function emitProcessLogs(runId, agentId, app) {
   ];
 
   for (const log of logs) {
-    await postLog("/ingest/process", log);
+    await postLog(log);
   }
   return logs.length;
 }
@@ -193,7 +246,7 @@ async function emitDatabaseLogs(runId, agentId, app) {
   ];
 
   for (const log of logs) {
-    await postLog("/ingest/db", log);
+    await postLog(log);
   }
   return logs.length;
 }
@@ -229,7 +282,7 @@ async function main() {
 
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const summary = [
-    `Emitted ${total} logs to ${AGENT_LOGS_URL}:`,
+    `Emitted ${total} OTLP log records to ${AGENT_LOGS_URL}/v1/logs:`,
     `  backend:  ${counts.backend}`,
     `  browser:  ${counts.browser}`,
     `  process:  ${counts.process}`,

@@ -25,27 +25,24 @@ All ports bind to `127.0.0.1` by default. Configured via `.env` (copied from `.e
 | Service | Port | Purpose |
 |---------|------|---------|
 | VictoriaLogs | 9428 | Log storage + LogsQL query API |
-| Vector | 8688 | HTTP log ingest (all `/ingest/*` paths) |
+| Vector OTLP HTTP | 4318 | OTLP HTTP ingest (`/v1/logs`, `/v1/traces`) |
+| Vector OTLP gRPC | 4317 | OTLP gRPC ingest |
 | Vector metrics | 9598 | Prometheus metrics exporter |
 | VictoriaMetrics | 8428 | Metrics storage + PromQL query API |
-| Phoenix | 6006 | Trace UI + OTLP HTTP (`/v1/traces`) |
-| Phoenix gRPC | 4317 | OTLP gRPC collector |
+| Phoenix | 6006 | Trace UI |
 
 ## Sending Logs
 
-POST JSON to Vector. The URL path determines the `source` field:
+POST OTLP JSON to `http://127.0.0.1:4318/v1/logs`, or use `emit-log.sh`:
 
 ```bash
-# Backend/app logs (source=backend)
-curl -X POST http://127.0.0.1:8688/ingest/logs -H 'Content-Type: application/json' \
-  -d '{"message":"hello","app":"myapp","service":"api"}'
+# CLI (simplest)
+./scripts/emit-log.sh --app myapp "Server started on port 3000"
+./scripts/emit-log.sh --app myapp --source browser --screen-id checkout "click event"
 
-# Browser logs (source=browser)
-curl -X POST http://127.0.0.1:8688/ingest/browser -H 'Content-Type: application/json' \
-  -d '{"message":"click","app":"myapp","screen_id":"checkout"}'
-
-# Database logs (source=database)  → /ingest/db
-# Process logs (source=process)    → /ingest/process
+# OTLP JSON (curl)
+curl -X POST http://127.0.0.1:4318/v1/logs -H 'Content-Type: application/json' \
+  -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"app","value":{"stringValue":"myapp"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"timeUnixNano":"0","severityText":"INFO","severityNumber":9,"body":{"stringValue":"hello"},"attributes":[{"key":"source","value":{"stringValue":"backend"}}]}]}]}]}'
 ```
 
 ## Querying Logs
@@ -58,18 +55,18 @@ curl -s 'http://127.0.0.1:9428/select/logsql/query' \
 ## Architecture
 
 ```
-app/browser/process → POST /ingest/* → Vector (8688)
-    → VRL normalize (defaults for timestamp, level, message, source, app, service)
+app/browser/process → OTLP JSON → Vector (4317 gRPC / 4318 HTTP)
+    → VRL normalize (severityText→level, resource attrs→app/service, defaults)
     → VictoriaLogs /insert/jsonline (9428)
     → LogsQL query API
 
 vmagent scrapes /metrics from: victoria-logs, vector, victoria-metrics, phoenix
     → VictoriaMetrics (8428)
 
-instrumented app → OTLP → Phoenix (6006)
+Phoenix (6006) — Trace UI
 ```
 
-**Vector config**: `config/vector.yaml` — single `http_server` source with `strict_path: false`, VRL transform for normalization, HTTP sink to VictoriaLogs with gzip + disk buffer.
+**Vector config**: `config/vector.yaml` — `opentelemetry` source (gRPC + HTTP), VRL transform for normalization, HTTP sink to VictoriaLogs with gzip + disk buffer.
 
 **VictoriaLogs sink URL** includes `_stream_fields=app,source,service`. Do not add high-cardinality fields (`agent_id`, `run_id`, `screen_id`) to stream fields.
 
@@ -83,19 +80,13 @@ instrumented app → OTLP → Phoenix (6006)
 
 - `requirements.md` — full spec, schema contract, resolved design decisions
 - `docker-compose.yml` — all 5 services, health checks, volumes
-- `config/vector.yaml` — ingest routes, VRL normalization, VictoriaLogs sink
+- `config/vector.yaml` — OTLP source, VRL normalization, VictoriaLogs sink
 - `config/vmagent.yaml` — Prometheus scrape targets
 - `.env.example` — pinned image versions, ports, retention
 
 ## What's Not Built Yet
 
-The requirements.md specifies these components that don't exist yet:
-
-- `scripts/query-logs.sh`, `scripts/emit-log.sh`, `scripts/tail-logs.sh`, `scripts/tail-file.sh`, `scripts/query-metrics.sh`, `scripts/discover-app.sh`
-- `scripts/e2e.sh` and `tests/e2e/`
-- `packages/browser-logger`, `packages/node-logger`, `packages/vite-plugin-agent-logs`
-- `examples/log-generator`, `examples/vite-browser-logs`
-- `README.md`
+All scripts and the log-generator example are implemented. No major unbuilt components remain.
 
 ## Development Notes
 

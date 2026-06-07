@@ -6,7 +6,8 @@ show_help() {
   cat <<'EOF'
 Usage: tail-file.sh [OPTIONS] [FILE]
 
-Ship lines from a file (tail -F) or stdin to Vector with metadata enrichment.
+Ship lines from a file (tail -F) or stdin to an OTLP HTTP collector as log
+records. Each line becomes one OTLP logRecord POSTed to /v1/logs.
 
 If FILE is given, tail it with tail -F semantics (follows rotation).
 If no FILE and stdin is not a terminal, read stdin line by line until EOF.
@@ -21,7 +22,7 @@ Options:
   --help              Show this help message
 
 Environment variables:
-  AGENT_LOGS_URL      Vector ingest base URL (default: http://127.0.0.1:8688)
+  AGENT_LOGS_URL      OTLP HTTP base URL (default: http://127.0.0.1:4318)
   AGENT_ID            Default agent identifier
   RUN_ID              Default run identifier
   WORKTREE            Default worktree name
@@ -35,7 +36,7 @@ EOF
 }
 
 # --- Defaults ---
-AGENT_LOGS_URL="${AGENT_LOGS_URL:-http://127.0.0.1:8688}"
+AGENT_LOGS_URL="${AGENT_LOGS_URL:-http://127.0.0.1:4318}"
 APP="unknown"
 SERVICE="unknown"
 SOURCE="process"
@@ -84,15 +85,8 @@ if [[ -z "$WORKTREE_VAL" ]]; then
   WORKTREE_VAL="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || basename "$(pwd)")"
 fi
 
-# --- Determine ingest path based on source ---
-case "$SOURCE" in
-  browser)  INGEST_PATH="/ingest/browser" ;;
-  database) INGEST_PATH="/ingest/db" ;;
-  backend)  INGEST_PATH="/ingest/logs" ;;
-  *)        INGEST_PATH="/ingest/process" ;;
-esac
-
-INGEST_URL="${AGENT_LOGS_URL}${INGEST_PATH}"
+# --- OTLP endpoint ---
+OTLP_URL="${AGENT_LOGS_URL}/v1/logs"
 
 # --- Determine process name and PID ---
 PROCESS_PID=$$
@@ -115,42 +109,55 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-# --- Send a single line as a log event ---
+# --- Send a single line as an OTLP log record ---
 send_line() {
   local line="$1"
-  local ts
-  ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local time_unix_nano
+  time_unix_nano="$(date +%s)000000000"
 
   local payload
-  payload=$(printf '%s' "{}" | jq -c \
-    --arg message "$line" \
-    --arg timestamp "$ts" \
-    --arg level "info" \
-    --arg source "$SOURCE" \
+  payload=$(jq -n -c \
+    --arg service_name "$SERVICE" \
     --arg app "$APP" \
-    --arg service "$SERVICE" \
+    --arg source "$SOURCE" \
     --arg agent_id "$AGENT_ID_VAL" \
     --arg run_id "$RUN_ID_VAL" \
     --arg worktree "$WORKTREE_VAL" \
     --arg log_file "$LOG_FILE" \
     --arg process_name "$PROCESS_NAME" \
     --argjson pid "$PROCESS_PID" \
+    --arg time_unix_nano "$time_unix_nano" \
+    --arg body "$line" \
     '{
-      message: $message,
-      timestamp: $timestamp,
-      level: $level,
-      source: $source,
-      app: $app,
-      service: $service,
-      agent_id: $agent_id,
-      run_id: $run_id,
-      worktree: $worktree,
-      log_file: $log_file,
-      process_name: $process_name,
-      pid: $pid
+      "resourceLogs": [{
+        "resource": {
+          "attributes": [
+            {"key": "service.name", "value": {"stringValue": $service_name}},
+            {"key": "app", "value": {"stringValue": $app}}
+          ]
+        },
+        "scopeLogs": [{
+          "scope": {},
+          "logRecords": [{
+            "timeUnixNano": $time_unix_nano,
+            "severityText": "INFO",
+            "severityNumber": 9,
+            "body": {"stringValue": $body},
+            "attributes": [
+              {"key": "source", "value": {"stringValue": $source}},
+              {"key": "agent_id", "value": {"stringValue": $agent_id}},
+              {"key": "run_id", "value": {"stringValue": $run_id}},
+              {"key": "worktree", "value": {"stringValue": $worktree}},
+              {"key": "log_file", "value": {"stringValue": $log_file}},
+              {"key": "process_name", "value": {"stringValue": $process_name}},
+              {"key": "pid", "value": {"intValue": $pid}}
+            ]
+          }]
+        }]
+      }]
     }')
 
-  curl -s -o /dev/null -X POST "$INGEST_URL" \
+  curl -s -o /dev/null -X POST "$OTLP_URL" \
     -H 'Content-Type: application/json' \
     -d "$payload" || true
 }

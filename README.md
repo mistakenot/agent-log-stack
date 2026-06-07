@@ -7,7 +7,7 @@ Local observability stack for AI coding agents. Collects logs, metrics, and trac
 ```bash
 git clone <repo-url> && cd agent-logs
 ./start.sh
-# Stack is ready. Ingest on :8688, query on :9428, metrics on :8428, traces on :6006.
+# Stack is ready. OTLP on :4318, query on :9428, metrics on :8428, traces UI on :6006.
 ```
 
 ## Architecture
@@ -17,12 +17,12 @@ git clone <repo-url> && cd agent-logs
                          |   Your App/Agent  |
                          +-------------------+
                                   |
-                   POST /ingest/* (JSON)
+                    OTLP JSON (HTTP :4318 / gRPC :4317)
                                   v
                       +-----------------------+
-                      |  Vector (8688)        |
-                      |  HTTP ingest + VRL    |
-                      |  normalize transform  |
+                      | Vector (OTLP Collector)|
+                      | opentelemetry source  |
+                      | + VRL normalize       |
                       +-----------------------+
                                   |
                     /insert/jsonline (gzip)
@@ -40,12 +40,9 @@ git clone <repo-url> && cd agent-logs
                       | PromQL query API      |
                       +-----------------------+
 
-    Instrumented app ---> OTLP HTTP/gRPC
-                                  |
-                                  v
                       +-----------------------+
-                      | Phoenix (6006/4317)   |
-                      | Trace UI + collector  |
+                      | Phoenix (6006)        |
+                      | Trace UI              |
                       +-----------------------+
 ```
 
@@ -53,48 +50,118 @@ git clone <repo-url> && cd agent-logs
 
 | Service          | Port | Purpose                              |
 |------------------|------|--------------------------------------|
-| Vector           | 8688 | HTTP log ingest (all `/ingest/*`)    |
-| Vector metrics   | 9598 | Prometheus metrics exporter          |
+| Vector OTLP HTTP | 4318 | OTLP HTTP ingest (`/v1/logs`, `/v1/traces`) |
+| Vector OTLP gRPC | 4317 | OTLP gRPC ingest                     |
+| Vector metrics   | 9598 | Prometheus metrics exporter           |
 | VictoriaLogs     | 9428 | Log storage + LogsQL query API       |
 | VictoriaMetrics  | 8428 | Metrics storage + PromQL query API   |
-| Phoenix          | 6006 | Trace UI + OTLP HTTP (`/v1/traces`)  |
-| Phoenix gRPC     | 4317 | OTLP gRPC collector                  |
+| Phoenix          | 6006 | Trace UI                             |
 
 All ports bind to `127.0.0.1` by default. Override with `AGENT_LOGS_BIND=0.0.0.0` in `.env`.
 
 ## Sending Logs
 
-POST JSON to Vector. The URL path determines the `source` field.
+### With emit-log.sh (simplest)
 
 ```bash
-# Backend logs (source=backend)
-curl -X POST http://127.0.0.1:8688/ingest/logs \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"server started","app":"myapp","service":"api","level":"info"}'
-
-# Browser logs (source=browser)
-curl -X POST http://127.0.0.1:8688/ingest/browser \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"click","app":"myapp","screen_id":"checkout"}'
-
-# Database logs (source=database)
-curl -X POST http://127.0.0.1:8688/ingest/db \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"slow query: 2.3s","app":"myapp","service":"postgres"}'
-
-# Process logs (source=process)
-curl -X POST http://127.0.0.1:8688/ingest/process \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"process exited code=0","app":"myapp","service":"worker"}'
+./scripts/emit-log.sh --app myapp "Server started on port 3000"
+./scripts/emit-log.sh --app myapp --level error "Connection refused"
+./scripts/emit-log.sh --app myapp --source browser --screen-id home "page loaded"
+echo "piped message" | ./scripts/emit-log.sh --app myapp
 ```
 
-Vector automatically sets defaults for missing fields: `timestamp` (now), `level` (info), `message` ("no message"), `app` ("unknown"), `service` ("unknown").
+### With OTLP JSON (curl)
+
+POST OTLP JSON to the collector at `http://127.0.0.1:4318/v1/logs`:
+
+```bash
+curl -X POST http://127.0.0.1:4318/v1/logs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "resourceLogs": [{
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "api"}},
+          {"key": "app", "value": {"stringValue": "myapp"}}
+        ]
+      },
+      "scopeLogs": [{
+        "scope": {},
+        "logRecords": [{
+          "timeUnixNano": "1700000000000000000",
+          "severityText": "INFO",
+          "severityNumber": 9,
+          "body": {"stringValue": "server started"},
+          "attributes": [
+            {"key": "source", "value": {"stringValue": "backend"}}
+          ]
+        }]
+      }]
+    }]
+  }'
+```
+
+### With OpenTelemetry SDKs
+
+Any OTLP-compatible SDK can send logs. Set the endpoint:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+**Node.js** (`@opentelemetry/sdk-logs`):
+
+```javascript
+const { LoggerProvider, SimpleLogRecordProcessor } = require('@opentelemetry/sdk-logs');
+const { OTLPLogExporter } = require('@opentelemetry/exporter-logs-otlp-http');
+
+const provider = new LoggerProvider();
+provider.addLogRecordProcessor(new SimpleLogRecordProcessor(
+  new OTLPLogExporter({ url: 'http://127.0.0.1:4318/v1/logs' })
+));
+const logger = provider.getLogger('myapp');
+logger.emit({ body: 'hello from node', severityText: 'INFO' });
+```
+
+**Python** (`opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`):
+
+```python
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+provider = LoggerProvider()
+provider.add_log_record_processor(
+    SimpleLogRecordProcessor(OTLPLogExporter())
+)
+logger = provider.get_logger("myapp")
+```
+
+**Browser**: Use `@opentelemetry/sdk-logs` with `@opentelemetry/exporter-logs-otlp-http`, pointed at your dev server proxy or directly at `http://127.0.0.1:4318`.
+
+Vector normalizes OTLP fields via VRL: `body` becomes `message`, `severityText` becomes `level`, resource attributes `app` and `service.name` become top-level fields.
+
+#### OTLP severity mapping
+
+| Level | severityText | severityNumber |
+|-------|-------------|----------------|
+| trace | TRACE       | 1              |
+| debug | DEBUG       | 5              |
+| info  | INFO        | 9              |
+| warn  | WARN        | 13             |
+| error | ERROR       | 17             |
+| fatal | FATAL       | 21             |
+
+#### timeUnixNano
+
+- Bash: `"$(date +%s)000000000"`
+- JavaScript: `String(Date.now() * 1000000)`
 
 ## CLI Tools
 
 ### emit-log.sh
 
-Send a single log event from the command line.
+Send a single log event via OTLP.
 
 ```bash
 ./scripts/emit-log.sh --app myapp "Server started on port 3000"
@@ -125,7 +192,7 @@ Live-tail streaming logs from VictoriaLogs.
 
 ### tail-file.sh
 
-Ship lines from a file or stdin to Vector with metadata enrichment.
+Ship lines from a file or stdin to the OTLP collector with metadata enrichment.
 
 ```bash
 ./scripts/tail-file.sh --app myapp /var/log/myapp.log
@@ -220,18 +287,17 @@ curl -s 'http://127.0.0.1:8428/api/v1/query_range' \
 
 ### Required fields
 
-Vector sets defaults if missing. Always include `app` for meaningful filtering.
+Vector normalizes OTLP fields to these names. Always include `app` for meaningful filtering.
 
-| Field       | Type   | Default     | Description                         |
-|-------------|--------|-------------|-------------------------------------|
-| `timestamp` | string | now (ISO)   | Event time in RFC3339 format        |
-| `level`     | string | `"info"`    | debug, info, warn, error, fatal     |
-| `message`   | string | `"no message"` | Human-readable log message      |
-| `source`    | string | from path   | backend, browser, database, process |
-| `app`       | string | `"unknown"` | Application name                    |
-| `service`   | string | `"unknown"` | Service/component within app        |
+| Field       | OTLP source              | Default        | Description                         |
+|-------------|--------------------------|----------------|-------------------------------------|
+| `message`   | `body.stringValue`       | `"no message"` | Human-readable log message          |
+| `level`     | `severityText`           | `"info"`        | debug, info, warn, error, fatal     |
+| `app`       | resource attr `app`      | `"unknown"`     | Application name                    |
+| `service`   | resource attr `service.name` | `"unknown"` | Service/component within app        |
+| `source`    | log attr `source`        | `"backend"`     | backend, browser, database, process |
 
-### Recommended fields
+### Recommended fields (log attributes)
 
 | Field        | Description                        |
 |--------------|------------------------------------|
@@ -243,101 +309,20 @@ Vector sets defaults if missing. Always include `app` for meaningful filtering.
 | `hostname`   | Machine hostname                   |
 | `log_file`   | Source file path (for tail-file)   |
 | `error_stack`| Error stack trace                  |
-| `route`      | HTTP route or page path            |
-| `url`        | Full URL (browser)                 |
-| `user_agent` | Browser user agent string          |
-| `viewport`   | Viewport dimensions (browser)      |
 
 Do not add high-cardinality fields (`agent_id`, `run_id`, `screen_id`) to VictoriaLogs `_stream_fields`. They are indexed as log fields, not stream labels.
 
 ## Environment Variables
 
-| Variable              | Default                      | Used by            |
-|-----------------------|------------------------------|--------------------|
-| `AGENT_LOGS_URL`      | `http://127.0.0.1:8688`     | All scripts, packages |
-| `VICTORIA_LOGS_URL`   | `http://127.0.0.1:9428`     | query-logs, tail-logs |
-| `VICTORIA_METRICS_URL`| `http://127.0.0.1:8428`     | query-metrics      |
-| `AGENT_ID`            | hostname                     | emit-log, tail-file |
-| `RUN_ID`              | `<timestamp>-<pid>`          | emit-log, tail-file |
-| `WORKTREE`            | git branch or cwd basename   | emit-log, tail-file |
-| `APP`                 | (none)                       | node-logger        |
-| `SERVICE`             | (none)                       | node-logger        |
-
-## Integration Packages
-
-### @agent-logs/browser-logger
-
-Captures browser `console.*`, unhandled errors, and promise rejections.
-
-```typescript
-import { createLogger } from "@agent-logs/browser-logger";
-
-const logger = createLogger({
-  app: "myapp",
-  screenId: "dashboard",
-});
-
-logger.info("Page loaded");
-logger.error("Something failed", { context: "checkout" });
-
-// Remove global error listeners
-logger.destroy();
-```
-
-Posts to `/__agent_logs/browser` by default (use Vite plugin proxy in dev).
-
-### @agent-logs/node-logger
-
-Wraps `console.*` to emit logs to Vector while preserving normal console output.
-
-```typescript
-import { createLogger } from "@agent-logs/node-logger";
-
-const logger = createLogger({
-  app: "myapp",
-  service: "api",
-});
-
-logger.info("Server started on port 3000");
-logger.error("Database connection failed");
-```
-
-Posts to `http://127.0.0.1:8688/ingest/logs`. Override with `url` option or `AGENT_LOGS_URL` env var.
-
-### @agent-logs/vite-plugin
-
-Vite plugin that proxies `/__agent_logs/browser` to Vector and optionally injects browser-logger.
-
-```typescript
-// vite.config.ts
-import agentLogs from "@agent-logs/vite-plugin";
-
-export default {
-  plugins: [
-    agentLogs({ app: "myapp", inject: true }),
-  ],
-};
-```
-
-## Vite Proxy
-
-The Vite plugin sets up a dev server proxy:
-
-```
-Browser: POST /__agent_logs/browser
-  --> Vite dev server proxy
-  --> http://127.0.0.1:8688/ingest/browser (Vector)
-```
-
-Configuration options:
-
-| Option   | Default                      | Description                            |
-|----------|------------------------------|----------------------------------------|
-| `target` | `AGENT_LOGS_URL` or `:8688`  | Vector ingest base URL                 |
-| `app`    | `"app"`                      | App name for injected logger           |
-| `inject` | `false`                      | Auto-inject browser-logger script tag  |
-
-When `inject: true`, a `<script type="module">` tag is added to HTML in dev mode that initializes browser-logger with the configured `app` name.
+| Variable                       | Default                      | Used by            |
+|--------------------------------|------------------------------|--------------------|
+| `AGENT_LOGS_URL`               | `http://127.0.0.1:4318`     | emit-log, tail-file, log-generator |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | (none)                       | OpenTelemetry SDKs |
+| `VICTORIA_LOGS_URL`            | `http://127.0.0.1:9428`     | query-logs         |
+| `VICTORIA_METRICS_URL`         | `http://127.0.0.1:8428`     | query-metrics      |
+| `AGENT_ID`                     | hostname                     | emit-log, tail-file |
+| `RUN_ID`                       | `<timestamp>-<pid>`          | emit-log, tail-file |
+| `WORKTREE`                     | git branch or cwd basename   | emit-log, tail-file |
 
 ## Lifecycle
 
@@ -350,35 +335,28 @@ When `inject: true`, a `<script type="module">` tag is added to HTML in dev mode
 
 ## Testing
 
-Run the end-to-end test suite (requires the stack to be running):
-
 ```bash
 ./scripts/e2e.sh
 ```
 
-The e2e script:
-1. Starts the stack if not already running
-2. Emits test logs via each ingest path
-3. Queries VictoriaLogs to verify ingestion
-4. Checks metrics are being scraped
-5. Reports pass/fail for each check
+The e2e script starts an isolated stack, emits OTLP test logs, queries VictoriaLogs to verify ingestion, checks metrics, and reports pass/fail.
 
 ## Troubleshooting
 
 **Stack fails to start**
 - Check Docker is running: `docker info`
-- Check ports are free: `lsof -i :8688 -i :9428 -i :8428 -i :6006`
+- Check ports are free: `lsof -i :4318 -i :9428 -i :8428 -i :6006`
 - Copy env file if missing: `cp .env.example .env`
 
 **Logs not appearing in queries**
-- Verify Vector is healthy: `curl -s http://127.0.0.1:8686/health`
+- Verify Vector is healthy: `curl -s http://127.0.0.1:8686/health` (Vector internal API, not exposed to host by default)
 - Check VictoriaLogs health: `curl -s http://127.0.0.1:9428/health`
-- Ensure `app` field is set (logs with `app="unknown"` are still stored but hard to filter)
+- Ensure `app` resource attribute is set
 - Wait 1-2 seconds after ingest for indexing
 
-**curl to Vector returns connection refused**
+**OTLP ingest returns connection refused**
 - Stack not running: `./start.sh`
-- Port mismatch: check `.env` for `VECTOR_INGEST_PORT`
+- Port mismatch: check `.env` for `OTEL_HTTP_PORT`
 
 **VictoriaLogs health check fails in container**
 - Known issue: use `127.0.0.1` not `localhost` (IPv6 resolution fails in alpine containers)
@@ -386,10 +364,6 @@ The e2e script:
 **Metrics query returns empty results**
 - vmagent scrapes every 15s by default; wait and retry
 - Check scrape targets: `curl -s http://127.0.0.1:8428/api/v1/query?query=up`
-
-**Phoenix traces not showing**
-- Verify OTLP endpoint: `curl -s http://127.0.0.1:6006/healthz`
-- Send test trace via gRPC (4317) or HTTP (6006/v1/traces)
 
 **Vector VRL transform errors**
 - VRL is strict about error handling; use `if !exists(.field)` patterns

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# emit-log.sh — Send a log event to Vector's HTTP ingest endpoint.
+# emit-log.sh — Send a log event via OTLP HTTP to the Vector collector.
 
 show_help() {
   cat <<'EOF'
 Usage: emit-log.sh [OPTIONS] [MESSAGE]
 
-Send a log event to Vector's HTTP ingest endpoint.
+Send a log event via OTLP HTTP (/v1/logs) to the Vector collector.
 
 If MESSAGE is not provided as a positional argument and stdin is not a
 terminal, the message is read from stdin.
@@ -17,7 +17,7 @@ Options:
   --service NAME      Service name (optional)
   --source NAME       Log source: backend, browser, database, process
                       (default: backend)
-  --level LEVEL       Log level: debug, info, warn, error, fatal
+  --level LEVEL       Log level: trace, debug, info, warn, error, fatal
                       (default: info)
   --agent-id ID       Agent identifier
                       (default: $AGENT_ID or hostname)
@@ -30,7 +30,7 @@ Options:
   --help              Show this help and exit
 
 Environment variables:
-  AGENT_LOGS_URL      Base URL for Vector ingest (default: http://127.0.0.1:8688)
+  AGENT_LOGS_URL      Base URL for OTLP HTTP ingest (default: http://127.0.0.1:4318)
   AGENT_ID            Default agent identifier
   RUN_ID              Default run identifier
   WORKTREE            Default worktree identifier
@@ -132,53 +132,79 @@ if [[ -z "$worktree_val" ]]; then
   fi
 fi
 
-# Map source to ingest path
-case "$source_val" in
-  browser)
-    ingest_path="/ingest/browser"
-    ;;
-  database)
-    ingest_path="/ingest/db"
-    ;;
-  process)
-    ingest_path="/ingest/process"
-    ;;
-  *)
-    ingest_path="/ingest/logs"
-    ;;
+# Map severity text and number
+sev_text=$(echo "$level_val" | tr "[:lower:]" "[:upper:]")
+case "$level_val" in
+  trace) sev_num=1 ;;
+  debug) sev_num=5 ;;
+  info)  sev_num=9 ;;
+  warn)  sev_num=13 ;;
+  error) sev_num=17 ;;
+  fatal) sev_num=21 ;;
+  *)     sev_num=9 ;;
 esac
 
 # Build URL
-base_url="${AGENT_LOGS_URL:-http://127.0.0.1:8688}"
-url="${base_url}${ingest_path}"
+base_url="${AGENT_LOGS_URL:-http://127.0.0.1:4318}"
+url="${base_url}/v1/logs"
 
 if [[ "$verbose" == "true" ]]; then
   echo "POST $url" >&2
 fi
 
-# Build JSON payload
-json_payload="{"
-json_payload+="\"message\":$(printf '%s' "$message" | jq -Rs .)"
-json_payload+=",\"level\":$(printf '%s' "$level_val" | jq -Rs .)"
-json_payload+=",\"source\":$(printf '%s' "$source_val" | jq -Rs .)"
-json_payload+=",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\""
-json_payload+=",\"agent_id\":$(printf '%s' "$agent_id_val" | jq -Rs .)"
-json_payload+=",\"run_id\":$(printf '%s' "$run_id_val" | jq -Rs .)"
-json_payload+=",\"worktree\":$(printf '%s' "$worktree_val" | jq -Rs .)"
-
-if [[ -n "$app_val" ]]; then
-  json_payload+=",\"app\":$(printf '%s' "$app_val" | jq -Rs .)"
-fi
-
+# Build resource attributes array
+res_attrs='[]'
 if [[ -n "$service_val" ]]; then
-  json_payload+=",\"service\":$(printf '%s' "$service_val" | jq -Rs .)"
+  res_attrs=$(jq -n --arg svc "$service_val" '[{"key":"service.name","value":{"stringValue":$svc}}]')
+fi
+if [[ -n "$app_val" ]]; then
+  res_attrs=$(echo "$res_attrs" | jq --arg app "$app_val" '. + [{"key":"app","value":{"stringValue":$app}}]')
 fi
 
+# Build log record attributes array (only non-empty values)
+log_attrs='[]'
+if [[ -n "$source_val" ]]; then
+  log_attrs=$(echo "$log_attrs" | jq --arg v "$source_val" '. + [{"key":"source","value":{"stringValue":$v}}]')
+fi
+if [[ -n "$agent_id_val" ]]; then
+  log_attrs=$(echo "$log_attrs" | jq --arg v "$agent_id_val" '. + [{"key":"agent_id","value":{"stringValue":$v}}]')
+fi
+if [[ -n "$run_id_val" ]]; then
+  log_attrs=$(echo "$log_attrs" | jq --arg v "$run_id_val" '. + [{"key":"run_id","value":{"stringValue":$v}}]')
+fi
+if [[ -n "$worktree_val" ]]; then
+  log_attrs=$(echo "$log_attrs" | jq --arg v "$worktree_val" '. + [{"key":"worktree","value":{"stringValue":$v}}]')
+fi
 if [[ -n "$screen_id_val" ]]; then
-  json_payload+=",\"screen_id\":$(printf '%s' "$screen_id_val" | jq -Rs .)"
+  log_attrs=$(echo "$log_attrs" | jq --arg v "$screen_id_val" '. + [{"key":"screen_id","value":{"stringValue":$v}}]')
 fi
 
-json_payload+="}"
+# Timestamp as epoch nanoseconds (string)
+time_unix_nano="$(date +%s)000000000"
+
+# Assemble OTLP JSON payload
+json_payload=$(jq -n \
+  --argjson res_attrs "$res_attrs" \
+  --argjson log_attrs "$log_attrs" \
+  --arg tn "$time_unix_nano" \
+  --arg st "$sev_text" \
+  --argjson sn "$sev_num" \
+  --arg body "$message" \
+  '{
+    resourceLogs: [{
+      resource: { attributes: $res_attrs },
+      scopeLogs: [{
+        scope: {},
+        logRecords: [{
+          timeUnixNano: $tn,
+          severityText: $st,
+          severityNumber: $sn,
+          body: { stringValue: $body },
+          attributes: $log_attrs
+        }]
+      }]
+    }]
+  }')
 
 # Send request
 http_code=$(curl -s -o /dev/stdout -w '\n%{http_code}' \

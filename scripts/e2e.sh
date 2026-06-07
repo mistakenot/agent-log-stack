@@ -23,7 +23,7 @@ Options:
 
 Environment variables:
   KEEP_STACK          Set to 1 to leave the Docker stack running after tests
-  AGENT_LOGS_URL      Vector ingest URL (default: http://127.0.0.1:8688)
+  AGENT_LOGS_URL      OTLP collector URL (default: http://127.0.0.1:4318)
   VICTORIA_LOGS_URL   VictoriaLogs URL (default: http://127.0.0.1:9428)
   VICTORIA_METRICS_URL  VictoriaMetrics URL (default: http://127.0.0.1:8428)
 
@@ -41,7 +41,7 @@ fi
 # --- Configuration ---
 
 KEEP_STACK="${KEEP_STACK:-0}"
-AGENT_LOGS_URL="${AGENT_LOGS_URL:-http://127.0.0.1:8688}"
+AGENT_LOGS_URL="${AGENT_LOGS_URL:-http://127.0.0.1:4318}"
 VICTORIA_LOGS_URL="${VICTORIA_LOGS_URL:-http://127.0.0.1:9428}"
 VICTORIA_METRICS_URL="${VICTORIA_METRICS_URL:-http://127.0.0.1:8428}"
 PHOENIX_URL="http://127.0.0.1:6006"
@@ -125,10 +125,10 @@ log_section "Port availability"
 
 PORTS_TO_CHECK=(
   "9428:VictoriaLogs"
-  "8688:Vector"
+  "4318:OTLP-HTTP"
   "8428:VictoriaMetrics"
   "6006:Phoenix"
-  "4317:Phoenix-gRPC"
+  "4317:OTLP-gRPC"
   "9598:Vector-metrics"
 )
 
@@ -207,23 +207,24 @@ wait_for_health() {
 }
 
 wait_for_health "VictoriaLogs" "${VICTORIA_LOGS_URL}/health" 45
-wait_for_vector() {
+wait_for_otlp() {
   local max_attempts=45
   local attempt=0
+  local probe_payload='{"resourceLogs":[{"resource":{"attributes":[{"key":"app","value":{"stringValue":"_e2e_probe"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"timeUnixNano":"0","body":{"stringValue":"health-probe"}}]}]}]}'
   while [[ $attempt -lt $max_attempts ]]; do
-    if curl -sf -X POST "${AGENT_LOGS_URL}/ingest/logs" \
+    if curl -sf -X POST "${AGENT_LOGS_URL}/v1/logs" \
          -H 'Content-Type: application/json' \
-         -d '{"message":"health-probe","app":"_e2e_probe"}' >/dev/null 2>&1; then
-      log "Vector: healthy"
+         -d "$probe_payload" >/dev/null 2>&1; then
+      log "OTLP collector: healthy"
       return 0
     fi
     attempt=$((attempt + 1))
     sleep 2
   done
-  echo "ERROR: Vector failed to become healthy after $((max_attempts * 2))s (url: ${AGENT_LOGS_URL})" >&2
+  echo "ERROR: OTLP collector failed to become healthy after $((max_attempts * 2))s (url: ${AGENT_LOGS_URL}/v1/logs)" >&2
   return 1
 }
-wait_for_vector
+wait_for_otlp
 wait_for_health "VictoriaMetrics" "${VICTORIA_METRICS_URL}/health" 45
 wait_for_health "Phoenix" "${PHOENIX_URL}/healthz" 60
 
@@ -285,14 +286,14 @@ OTLP_EOF
 )
 
 OTLP_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X POST "${PHOENIX_URL}/v1/traces" \
+  -X POST "${AGENT_LOGS_URL}/v1/traces" \
   -H "Content-Type: application/json" \
   -d "$OTLP_PAYLOAD") || true
 
 if [[ "$OTLP_HTTP_CODE" -ge 200 && "$OTLP_HTTP_CODE" -lt 300 ]]; then
-  log "OTLP trace sent (HTTP $OTLP_HTTP_CODE)"
+  log "OTLP trace sent to collector (HTTP $OTLP_HTTP_CODE)"
 else
-  log "WARNING: OTLP trace may have failed (HTTP $OTLP_HTTP_CODE)"
+  log "WARNING: OTLP collector returned non-2xx for traces (HTTP $OTLP_HTTP_CODE) — Vector may not forward traces"
 fi
 
 # --- Wait for ingestion ---

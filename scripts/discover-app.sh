@@ -17,7 +17,7 @@ Options:
   --help        Show this help message
 
 Environment variables:
-  AGENT_LOGS_URL         (default http://127.0.0.1:8688)
+  AGENT_LOGS_URL         (default http://127.0.0.1:4318)
   VICTORIA_LOGS_URL      (default http://127.0.0.1:9428)
   VICTORIA_METRICS_URL   (default http://127.0.0.1:8428)
 

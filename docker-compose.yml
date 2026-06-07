@@ -20,7 +20,8 @@ services:
   vector:
     image: timberio/vector:${VECTOR_VERSION}
     ports:
-      - "${AGENT_LOGS_BIND:-127.0.0.1}:${VECTOR_INGEST_PORT:-8688}:8688"
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${OTEL_GRPC_PORT:-4317}:4317"
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${OTEL_HTTP_PORT:-4318}:4318"
       - "${AGENT_LOGS_BIND:-127.0.0.1}:${VECTOR_METRICS_PORT:-9598}:9598"
     volumes:
       - ./config/vector.yaml:/etc/vector/vector.yaml:ro
@@ -67,7 +68,6 @@ services:
     image: arizephoenix/phoenix:${PHOENIX_VERSION}
     ports:
       - "${AGENT_LOGS_BIND:-127.0.0.1}:${PHOENIX_PORT:-6006}:6006"
-      - "${AGENT_LOGS_BIND:-127.0.0.1}:${PHOENIX_GRPC_PORT:-4317}:4317"
     volumes:
       - phoenix_data:/mnt/data
     environment:
