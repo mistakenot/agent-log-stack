@@ -1,3 +1,109 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What This Repo Is
+
+Local observability stack for development environments driven by AI coding agents. Collects logs, metrics, and traces from **apps and runtimes the agent is driving** — not the agent's own chat history. The primary user is an agent calling CLI tools and HTTP endpoints, not a human watching dashboards.
+
+## Stack Commands
+
+```bash
+# Start everything (preflight checks, docker compose up, prints URLs)
+./start.sh
+
+# Individual lifecycle
+./scripts/up.sh          # docker compose up -d
+./scripts/down.sh        # docker compose down
+./scripts/reset.sh       # docker compose down -v (wipes all data)
+```
+
+## Services and Ports
+
+All ports bind to `127.0.0.1` by default. Configured via `.env` (copied from `.env.example` on first start).
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| VictoriaLogs | 9428 | Log storage + LogsQL query API |
+| Vector | 8688 | HTTP log ingest (all `/ingest/*` paths) |
+| Vector metrics | 9598 | Prometheus metrics exporter |
+| VictoriaMetrics | 8428 | Metrics storage + PromQL query API |
+| Phoenix | 6006 | Trace UI + OTLP HTTP (`/v1/traces`) |
+| Phoenix gRPC | 4317 | OTLP gRPC collector |
+
+## Sending Logs
+
+POST JSON to Vector. The URL path determines the `source` field:
+
+```bash
+# Backend/app logs (source=backend)
+curl -X POST http://127.0.0.1:8688/ingest/logs -H 'Content-Type: application/json' \
+  -d '{"message":"hello","app":"myapp","service":"api"}'
+
+# Browser logs (source=browser)
+curl -X POST http://127.0.0.1:8688/ingest/browser -H 'Content-Type: application/json' \
+  -d '{"message":"click","app":"myapp","screen_id":"checkout"}'
+
+# Database logs (source=database)  → /ingest/db
+# Process logs (source=process)    → /ingest/process
+```
+
+## Querying Logs
+
+```bash
+curl -s 'http://127.0.0.1:9428/select/logsql/query' \
+  -d 'query={app="myapp",source="backend"} | limit 10'
+```
+
+## Architecture
+
+```
+app/browser/process → POST /ingest/* → Vector (8688)
+    → VRL normalize (defaults for timestamp, level, message, source, app, service)
+    → VictoriaLogs /insert/jsonline (9428)
+    → LogsQL query API
+
+vmagent scrapes /metrics from: victoria-logs, vector, victoria-metrics, phoenix
+    → VictoriaMetrics (8428)
+
+instrumented app → OTLP → Phoenix (6006)
+```
+
+**Vector config**: `config/vector.yaml` — single `http_server` source with `strict_path: false`, VRL transform for normalization, HTTP sink to VictoriaLogs with gzip + disk buffer.
+
+**VictoriaLogs sink URL** includes `_stream_fields=app,source,service`. Do not add high-cardinality fields (`agent_id`, `run_id`, `screen_id`) to stream fields.
+
+## Log Schema
+
+**Required fields** (Vector sets defaults if missing): `timestamp`, `level`, `message`, `source`, `app`, `service`.
+
+**Recommended fields** (optional, for filtering): `agent_id`, `run_id`, `worktree`, `screen_id`, plus many others listed in `requirements.md`.
+
+## Key Files
+
+- `requirements.md` — full spec, schema contract, resolved design decisions
+- `docker-compose.yml` — all 5 services, health checks, volumes
+- `config/vector.yaml` — ingest routes, VRL normalization, VictoriaLogs sink
+- `config/vmagent.yaml` — Prometheus scrape targets
+- `.env.example` — pinned image versions, ports, retention
+
+## What's Not Built Yet
+
+The requirements.md specifies these components that don't exist yet:
+
+- `scripts/query-logs.sh`, `scripts/emit-log.sh`, `scripts/tail-logs.sh`, `scripts/tail-file.sh`, `scripts/query-metrics.sh`, `scripts/discover-app.sh`
+- `scripts/e2e.sh` and `tests/e2e/`
+- `packages/browser-logger`, `packages/node-logger`, `packages/vite-plugin-agent-logs`
+- `examples/log-generator`, `examples/vite-browser-logs`
+- `README.md`
+
+## Development Notes
+
+- Image versions are pinned in `.env.example`. After changing, run `docker compose pull`.
+- Vector VRL is strict about error coalescing (`??`) — use `if !exists(.field)` patterns instead.
+- Health checks use `wget` (VictoriaLogs/Vector/VictoriaMetrics alpine images) or `python3` (Phoenix).
+- VictoriaLogs health check must use `127.0.0.1` not `localhost` (IPv6 resolution fails in containers).
+
 <!-- br-agent-instructions-v1 -->
 
 ---
