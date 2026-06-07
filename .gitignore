@@ -1,0 +1,45 @@
+.ntm
+
+# Dependencies
+node_modules/
+.pnp.*
+.yarn/
+
+# Build output
+dist/
+build/
+*.tgz
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Docker persistent data (volumes are managed by compose)
+data/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs (ironic, but local debug logs don't belong in the repo)
+*.log
+npm-debug.log*
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# PM2
+.pm2/
