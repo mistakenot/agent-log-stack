@@ -1,0 +1,89 @@
+services:
+  victoria-logs:
+    image: victoriametrics/victoria-logs:${VICTORIA_LOGS_VERSION}
+    ports:
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${VICTORIA_LOGS_PORT:-9428}:9428"
+    volumes:
+      - victoria_logs_data:/victoria-logs-data
+    command:
+      - -storageDataPath=/victoria-logs-data
+      - -retentionPeriod=${VICTORIA_LOGS_RETENTION:-7d}
+      - -search.maxConcurrentRequests=16
+      - -search.maxQueryDuration=30s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vector:
+    image: timberio/vector:${VECTOR_VERSION}
+    ports:
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${VECTOR_INGEST_PORT:-8688}:8688"
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${VECTOR_METRICS_PORT:-9598}:9598"
+    volumes:
+      - ./config/vector.yaml:/etc/vector/vector.yaml:ro
+      - vector_data:/var/lib/vector
+    depends_on:
+      victoria-logs:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8686/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:${VICTORIA_METRICS_VERSION}
+    ports:
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${VICTORIA_METRICS_PORT:-8428}:8428"
+    volumes:
+      - victoria_metrics_data:/victoria-metrics-data
+    command:
+      - -storageDataPath=/victoria-metrics-data
+      - -retentionPeriod=7d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vmagent:
+    image: victoriametrics/vmagent:${VMAGENT_VERSION}
+    volumes:
+      - ./config/vmagent.yaml:/etc/vmagent/config.yaml:ro
+    command:
+      - -promscrape.config=/etc/vmagent/config.yaml
+      - -remoteWrite.url=http://victoria-metrics:8428/api/v1/write
+    depends_on:
+      victoria-metrics:
+        condition: service_healthy
+    restart: unless-stopped
+
+  phoenix:
+    image: arizephoenix/phoenix:${PHOENIX_VERSION}
+    ports:
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${PHOENIX_PORT:-6006}:6006"
+      - "${AGENT_LOGS_BIND:-127.0.0.1}:${PHOENIX_GRPC_PORT:-4317}:4317"
+    volumes:
+      - phoenix_data:/mnt/data
+    environment:
+      - PHOENIX_WORKING_DIR=/mnt/data
+      - PHOENIX_TELEMETRY_ENABLED=false
+      - PHOENIX_ENABLE_PROMETHEUS=true
+      - PHOENIX_DEFAULT_RETENTION_POLICY_DAYS=${PHOENIX_RETENTION_DAYS:-7}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6006/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  victoria_logs_data:
+  victoria_metrics_data:
+  vector_data:
+  phoenix_data:

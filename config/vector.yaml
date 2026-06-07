@@ -1,0 +1,72 @@
+api:
+  enabled: true
+  address: "0.0.0.0:8686"
+
+sources:
+  http_ingest:
+    type: http_server
+    address: "0.0.0.0:8688"
+    decoding:
+      codec: json
+    path: ""
+    strict_path: false
+    path_key: "_path"
+
+  internal_metrics:
+    type: internal_metrics
+
+transforms:
+  normalize:
+    type: remap
+    inputs: ["http_ingest"]
+    source: |
+      _path = del(._path)
+      if !exists(.source) {
+        if is_string(_path) && starts_with(string!(_path), "/ingest/browser") {
+          .source = "browser"
+        } else if is_string(_path) && starts_with(string!(_path), "/ingest/db") {
+          .source = "database"
+        } else if is_string(_path) && starts_with(string!(_path), "/ingest/process") {
+          .source = "process"
+        } else {
+          .source = "backend"
+        }
+      }
+
+      if !exists(.timestamp) { .timestamp = format_timestamp!(now(), format: "%+") }
+      if !exists(.level) { .level = "info" }
+      if !exists(.message) {
+        if exists(.msg) {
+          .message = del(.msg)
+        } else if exists(._msg) {
+          .message = del(._msg)
+        } else if exists(.event) {
+          .message = del(.event)
+        } else {
+          .message = "no message"
+        }
+      }
+      if !exists(.app) { .app = "unknown" }
+      if !exists(.service) { .service = "unknown" }
+
+sinks:
+  victoria_logs:
+    type: http
+    inputs: ["normalize"]
+    uri: "http://victoria-logs:9428/insert/jsonline?_stream_fields=app,source,service&_msg_field=message&_time_field=timestamp"
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    compression: gzip
+    healthcheck:
+      enabled: false
+    buffer:
+      type: disk
+      max_size: 536870912
+      when_full: block
+
+  prometheus_exporter:
+    type: prometheus_exporter
+    inputs: ["internal_metrics"]
+    address: "0.0.0.0:9598"
