@@ -207,7 +207,23 @@ wait_for_health() {
 }
 
 wait_for_health "VictoriaLogs" "${VICTORIA_LOGS_URL}/health" 45
-wait_for_health "Vector" "${AGENT_LOGS_URL}" 45
+wait_for_vector() {
+  local max_attempts=45
+  local attempt=0
+  while [[ $attempt -lt $max_attempts ]]; do
+    if curl -sf -X POST "${AGENT_LOGS_URL}/ingest/logs" \
+         -H 'Content-Type: application/json' \
+         -d '{"message":"health-probe","app":"_e2e_probe"}' >/dev/null 2>&1; then
+      log "Vector: healthy"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  echo "ERROR: Vector failed to become healthy after $((max_attempts * 2))s (url: ${AGENT_LOGS_URL})" >&2
+  return 1
+}
+wait_for_vector
 wait_for_health "VictoriaMetrics" "${VICTORIA_METRICS_URL}/health" 45
 wait_for_health "Phoenix" "${PHOENIX_URL}/healthz" 60
 
