@@ -199,8 +199,12 @@ The implementation should create this shape:
 ├── start.sh
 ├── config/
 │   ├── vector.yaml
-│   ├── vmagent.yaml
-│   └── victoria-logs.env
+│   └── vmagent.yaml
+
+<!-- RESOLVED(P3): config/victoria-logs.env listed but undefined and unused
+REVIEW: This file appears in the repository layout but no section in the requirements describes its contents or purpose. The current implementation configures VictoriaLogs entirely through CLI args in docker-compose.yml.
+AUTHOR: Removed from layout. VictoriaLogs is configured via docker-compose.yml command args and .env.example variables, which is simpler and consistent with how the other services are configured.
+-->
 ├── packages/
 │   ├── browser-logger/
 │   ├── node-logger/
@@ -254,7 +258,12 @@ The implementation should create this shape:
 - Use `/select/logsql/tail` as a documented optional live-tail path.
 - Expose the built-in Web UI at `/select/vmui/` only as a secondary manual-debugging surface.
 - All required workflows must work through CLI tools and HTTP APIs without opening the Web UI.
-- Default retention should be short and local-development friendly, for example 7 days, configurable by env.
+- Default retention should be short and local-development friendly, for example 7 days, configurable by env. Both VictoriaLogs and VictoriaMetrics retention must be configurable through `.env` variables (`VICTORIA_LOGS_RETENTION` and `VICTORIA_METRICS_RETENTION`).
+
+<!-- RESOLVED(P2): VictoriaMetrics retention is not env-configurable despite the same pattern being established for VictoriaLogs
+REVIEW: docker-compose.yml hardcodes VictoriaMetrics retention as `-retentionPeriod=7d` without an env var, while VictoriaLogs uses `${VICTORIA_LOGS_RETENTION:-7d}`.
+AUTHOR: Updated requirement to explicitly name both env vars. Implementation should add `VICTORIA_METRICS_RETENTION` to `.env.example` and use `${VICTORIA_METRICS_RETENTION:-7d}` in docker-compose.yml.
+-->
 - Query concurrency and duration should be configured conservatively, for example:
   - maximum query duration: 10s to 30s by default.
   - maximum concurrent query requests: enough for several parallel agents, configurable.
@@ -269,7 +278,11 @@ Vector must expose at least these endpoints:
 - `POST /ingest/browser`: frontend browser logs proxied from Vite.
 - `POST /ingest/process`: logs captured from PM2, command output, file tailing, or Docker stdout.
 - `POST /ingest/db`: database logs and database diagnostic events.
-- `POST /ingest/metrics`: optional Vector-native metric events if useful.
+
+<!-- RESOLVED(P2): /ingest/metrics endpoint purpose and routing are ambiguous
+REVIEW: The `/ingest/metrics` endpoint mixed concerns — this is a log ingestion pipeline to VictoriaLogs, not a metrics write path.
+AUTHOR: Removed `/ingest/metrics`. Metrics flow exclusively through Prometheus scrape via vmagent. Log-shaped metric events (e.g. "latency was 250ms") belong in `/ingest/logs` with appropriate fields. Time-series metrics belong in VictoriaMetrics via the Prometheus exposition format.
+-->
 - `GET /health`: simple health endpoint if Vector config supports it directly; otherwise provide script-level health checks against the Vector API or metrics exporter.
 
 The log endpoints must accept `application/json` single-event payloads. They should also accept newline-delimited JSON when practical because VictoriaLogs and Vector both fit NDJSON workflows well.
@@ -283,7 +296,13 @@ Required output fields:
 - `timestamp`: RFC3339 timestamp. If absent, set to ingestion time.
 - `level`: `trace`, `debug`, `info`, `warn`, `error`, or `fatal`. If absent, set `info`.
 - `message`: human-readable log message. If absent, derive from `msg`, `_msg`, `event`, or serialize the payload.
-- `source`: emitting source category. One of `backend`, `frontend`, `browser`, `dev_server`, `database`, `worker`, `queue`, `cache`, `test`, `tool`, `process`, `infra`, or `unknown`.
+- `source`: emitting source category. Vector auto-derives a default from the ingest path (`/ingest/browser` → `browser`, `/ingest/db` → `database`, `/ingest/process` → `process`, all others → `backend`). Clients may override by setting `source` explicitly in the JSON payload. Recognized values: `backend`, `browser`, `dev_server`, `database`, `worker`, `queue`, `cache`, `test`, `tool`, `process`, `infra`, or `unknown`. Path-based defaults are a convenience; explicit `source` in the payload always takes precedence.
+
+<!-- RESOLVED(P2): Most source values cannot be auto-derived — only 4 paths are routed
+REVIEW: 13 source values listed but only 4 auto-derived from path. `frontend` vs `browser` distinction was unclear.
+AUTHOR: Rewrote to clarify that path routing is a convenience default and explicit `source` in the payload takes precedence. Removed `frontend` — browser-side logs are `browser`, server-side rendering logs are `backend` with `service` distinguishing the component. This matches how agents actually think about the distinction.
+-->
+
 - `app`: application or repo-local app name.
 - `service`: service/component name.
 Recommended output fields:
@@ -327,26 +346,27 @@ Recommended output fields:
 
 ### Metadata Sources
 
-Clients may provide metadata through:
+Clients provide metadata through JSON payload fields. This is the primary and MVP-supported path. Agents constructing `curl` commands or using helper scripts naturally include metadata as JSON fields, which aligns with the agent-first design.
 
-- JSON payload fields.
-- HTTP headers such as `X-Agent-Id`, `X-Run-Id`, `X-Worktree`, `X-App`, and `X-Screen-Id`.
-- Query string fields such as `agent_id`, `run_id`, `worktree`, `app`, and `screen_id`.
+Future consideration: HTTP headers (`X-Agent-Id`, `X-Run-Id`, `X-Worktree`, `X-App`, `X-Screen-Id`) and query string fields could provide metadata for clients that cannot easily modify the JSON body (e.g. third-party log shippers). This requires Vector's `headers_key` config option and a VRL merge step to apply header values only when the corresponding JSON field is absent. This is not required for the MVP.
 
-Precedence should be:
-
-1. Explicit JSON payload fields.
-2. HTTP headers.
-3. Query string fields.
-4. Vector defaults.
+<!-- RESOLVED(P2): Vector http_server source does not natively expose request headers as event fields
+REVIEW: The original precedence chain (JSON > headers > query > defaults) required Vector header extraction that doesn't exist in the current config.
+AUTHOR: Simplified to JSON-payload-only for MVP. Agents set metadata in JSON bodies — that's the natural agent-first path. Header/query extraction noted as a future enhancement with the specific Vector config approach (`headers_key`) for when third-party shippers need it.
+-->
 
 ### VictoriaLogs Sink
 
 Vector must send logs to:
 
 ```text
-http://victoria-logs:9428/insert/jsonline?_stream_fields=app,source,worktree,service,process_type&_msg_field=message&_time_field=timestamp
+http://victoria-logs:9428/insert/jsonline?_stream_fields=app,source,service&_msg_field=message&_time_field=timestamp
 ```
+
+<!-- RESOLVED(P1): Stream fields in sink URL contradict Implementation Notes
+REVIEW: Original URL had `_stream_fields=app,source,worktree,service,process_type` but Implementation Notes said to keep high-cardinality fields out of stream fields.
+AUTHOR: Fixed sink URL to `_stream_fields=app,source,service` — matching the Implementation Notes and current implementation. `worktree` is per-agent/per-task and can be high-cardinality. `process_type` is only bounded if the emitting app uses a fixed set. Both remain queryable as normal fields, just not stream fields.
+-->
 
 Notes:
 
@@ -488,7 +508,12 @@ Phoenix requirements:
 - Expose Phoenix OTLP gRPC internally on `phoenix:4317`.
 - Set a short trace retention default with `PHOENIX_DEFAULT_RETENTION_POLICY_DAYS`, for example 7 days.
 - Disable external analytics/telemetry where possible for local trusted development, for example `PHOENIX_TELEMETRY_ENABLED=false`.
-- Enable Phoenix Prometheus metrics if useful for vmagent scraping, for example `PHOENIX_ENABLE_PROMETHEUS=true` and port `9090`.
+- Enable Phoenix Prometheus metrics if useful for vmagent scraping, for example `PHOENIX_ENABLE_PROMETHEUS=true`. Phoenix exposes metrics at `/metrics` on its main HTTP port (6006).
+
+<!-- RESOLVED(P3): Phoenix Prometheus metrics port 9090 is incorrect — Phoenix exposes metrics on its main port
+REVIEW: Original text referenced port 9090. Phoenix actually serves `/metrics` on its main port (6006).
+AUTHOR: Removed the incorrect port 9090 reference. vmagent scrapes `phoenix:6006/metrics` as configured in vmagent.yaml.
+-->
 - Do not configure Phoenix to forward traces into Victoria components.
 - Keep Phoenix deployment, trace ingestion, and trace storage independent from the Victoria logs/metrics services.
 - If future buffering, filtering, or redaction is needed for traces, add it within the Phoenix trace path only and keep it separate from Victoria.
@@ -565,8 +590,18 @@ The script must:
 - A clean run exits 0.
 - A missing log exits non-zero with the query that failed.
 - The script can be run repeatedly without using stale logs from a previous run.
-- The test does not require host services other than Docker, Docker Compose, `curl`, and a local runtime needed by examples.
-- The test can be run while another instance of the normal stack is already running by using a unique compose project and configurable host ports, or it fails early with a clear port-conflict message.
+- The test requires only Docker, Docker Compose, `curl`, and Node.js (>=18) on the host. The E2E script must check for these at startup and fail with a clear message if any are missing.
+
+<!-- RESOLVED(P2): "local runtime needed by examples" is ambiguous — Node.js dependency should be explicit
+REVIEW: "local runtime needed by examples" was too vague for preflight checks.
+AUTHOR: Made Node.js (>=18) an explicit named dependency. The Vite browser-log example needs it, and agents need a concrete list to preflight-check.
+-->
+- If the default ports are already in use, the E2E script must fail early with a clear message naming the conflicting port and suggesting the user stop the running stack (`./scripts/down.sh`) or set custom ports via environment variables. The E2E script must use a unique Docker Compose project name (e.g. `agent-logs-e2e-{RUN_ID}`) so containers don't collide with a dev stack, but port isolation via automatic port discovery is not required for MVP.
+
+<!-- RESOLVED(P2): E2E port isolation strategy undefined
+REVIEW: Original text was ambiguous between automatic port isolation and early failure.
+AUTHOR: MVP behavior is fail-early on port conflict with a helpful message. The compose project name is unique (preventing container-name collisions), but host ports use the same defaults. True port isolation (auto-discovery or offset ports) is deferred — it adds complexity without clear MVP value since agents typically run one stack at a time.
+-->
 
 ## Agent Ergonomics
 
@@ -636,7 +671,7 @@ These are local-development targets, not production SLOs.
 - VictoriaLogs calls the query language LogsQL. If scripts use the shorthand "LQL", document that it maps to VictoriaLogs LogsQL HTTP APIs.
 - Prefer flat snake_case fields in emitted logs. Avoid nested objects unless Vector transforms flatten them consistently.
 - Do not make `screen_id`, `url`, `route`, `task_id`, or `thread_id` stream fields unless cardinality is known to be low.
-- Prefer stream fields that define stable producer identity and routing: `app`, `source`, `worktree`, `service`, and bounded process fields such as `process_type`.
+- Prefer stream fields that define stable producer identity and routing: `app`, `source`, and `service`. Keep `worktree` and `process_type` as queryable non-stream fields — their cardinality depends on the caller's workflow and cannot be bounded by the stack.
 - Keep driver/session fields such as `agent_id`, `run_id`, `task_id`, and `thread_id` queryable but out of stream fields by default.
 - Use `fields` and `limit` pipes in examples so agent queries return compact responses.
 - Keep Grafana out of the MVP. CLI scripts and HTTP APIs are the product surface; VictoriaLogs Web UI is only a backup inspection tool.

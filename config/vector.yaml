@@ -3,56 +3,42 @@ api:
   address: "0.0.0.0:8686"
 
 sources:
-  http_ingest:
-    type: http_server
-    address: "0.0.0.0:8688"
-    decoding:
-      codec: json
-    path: ""
-    strict_path: false
-    path_key: "_path"
+  otel:
+    type: opentelemetry
+    grpc:
+      address: "0.0.0.0:4317"
+    http:
+      address: "0.0.0.0:4318"
 
   internal_metrics:
     type: internal_metrics
 
 transforms:
-  normalize:
+  normalize_logs:
     type: remap
-    inputs: ["http_ingest"]
+    inputs: ["otel.logs"]
     source: |
-      _path = del(._path)
-      if !exists(.source) {
-        if is_string(_path) && starts_with(string!(_path), "/ingest/browser") {
-          .source = "browser"
-        } else if is_string(_path) && starts_with(string!(_path), "/ingest/db") {
-          .source = "database"
-        } else if is_string(_path) && starts_with(string!(_path), "/ingest/process") {
-          .source = "process"
-        } else {
-          .source = "backend"
-        }
-      }
-
-      if !exists(.timestamp) { .timestamp = format_timestamp!(now(), format: "%+") }
-      if !exists(.level) { .level = "info" }
-      if !exists(.message) {
-        if exists(.msg) {
-          .message = del(.msg)
-        } else if exists(._msg) {
-          .message = del(._msg)
-        } else if exists(.event) {
-          .message = del(.event)
-        } else {
-          .message = "no message"
-        }
+      .level = del(.severity_text) ?? "info"
+      .level = downcase!(string!(.level))
+      if exists(.resources) {
+        if !exists(.app) { .app = del(.resources.app) ?? "unknown" }
+        if !exists(.service) { .service = del(.resources."service.name") ?? "unknown" }
       }
       if !exists(.app) { .app = "unknown" }
       if !exists(.service) { .service = "unknown" }
+      if !exists(.source) { .source = "backend" }
+      if !exists(.message) { .message = "no message" }
+      del(.severity_number)
+      del(.source_type)
+      del(.flags)
+      del(.observed_timestamp)
+      del(.resources)
+      del(.scope)
 
 sinks:
   victoria_logs:
     type: http
-    inputs: ["normalize"]
+    inputs: ["normalize_logs"]
     uri: "http://victoria-logs:9428/insert/jsonline?_stream_fields=app,source,service&_msg_field=message&_time_field=timestamp"
     encoding:
       codec: json

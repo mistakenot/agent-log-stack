@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "request-codex-review": {
+      "source": "mistakenot/skills",
+      "sourceType": "github",
+      "computedHash": "cfae379430298143d5c00d343a813abdc30adbc8f9a1953b806a51ad92003bcc"
+    },
+    "review-task": {
+      "source": "mistakenot/skills",
+      "sourceType": "github",
+      "computedHash": "aa5ba259210a4187ad3a9d98b4e5fdd05d66e5438e62f3a56cff416e0b490968"
+    }
+  }
+}

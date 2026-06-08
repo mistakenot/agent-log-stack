@@ -1,0 +1,11 @@
+{
+  "name": "@agent-logs/log-generator",
+  "version": "0.1.0",
+  "description": "Deterministic log generator for E2E tests across all ingest paths",
+  "type": "module",
+  "main": "generate.js",
+  "scripts": {
+    "generate": "node generate.js"
+  },
+  "license": "MIT"
+}

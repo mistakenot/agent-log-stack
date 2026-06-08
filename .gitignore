@@ -43,3 +43,6 @@ coverage/
 
 # PM2
 .pm2/
+
+# bv (beads viewer) local config and caches
+.bv/
